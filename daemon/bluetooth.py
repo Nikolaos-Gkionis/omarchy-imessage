@@ -26,14 +26,18 @@ from dbus_next.service import ServiceInterface, dbus_property, method
 
 from protocol import (
     address_from_thread,
+    audio_profile_uuids,
     classify_recipient,
     coerce_phone,
+    dominant_calling_code,
     extract_bmessage_peer,
     extract_bmessage_text,
+    is_audio_profile,
     normalize_email,
     parse_vcards,
     present_message,
     public_error,
+    thread_key,
 )
 from store import Store, runtime_dir
 
@@ -101,40 +105,6 @@ def _map_time(value: str) -> str:
     return f"{digits[0:4]}-{digits[4:6]}-{digits[6:8]}T{digits[8:10]}:{digits[10:12]}:{digits[12:14]}"
 
 
-def _read_adapter_class() -> tuple[int, int] | None:
-    """Current major/minor device class, so pairing can put the old one back."""
-    try:
-        result = subprocess.run(
-            ["btmgmt", "--timeout", "3", "info"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except FileNotFoundError:
-        return None
-    match = re.search(r"class (0x[0-9a-fA-F]+)", result.stdout or "")
-    if not match:
-        return None
-    value = int(match.group(1), 16)
-    minor = (value >> 2) & 0x3F
-    major = (value >> 8) & 0x1F
-    return major, minor
-
-
-def _set_adapter_class(major: int, minor: int) -> bool:
-    """Ask BlueZ to present this computer as a given device class. No sudo."""
-    try:
-        result = subprocess.run(
-            ["btmgmt", "--timeout", "3", "class", str(major), str(minor)],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except FileNotFoundError:
-        return False
-    return result.returncode == 0
-
-
 class PairAgent(ServiceInterface):
     """BlueZ pairing agent. It shows a 6-digit code and waits for the overlay."""
 
@@ -200,10 +170,10 @@ class PairAgent(ServiceInterface):
 
     @method()
     def AuthorizeService(self, device: "o", uuid: "s"):
-        # Registered only while the user is pairing. MAP and PBAP are the
-        # profiles this plugin uses. Rejecting unknown UUIDs here would also
-        # reject the phone's own handshake, so the user's confirmation above
-        # is the gate.
+        # Pairing confirmation is RequestConfirmation. This call is the
+        # later per-service allow. Headset and media profiles are refused.
+        if is_audio_profile(str(uuid)):
+            raise DBusError("org.bluez.Error.Rejected", "audio profiles are not used")
         return
 
     def _reject_if_waiting(self):
@@ -250,15 +220,13 @@ class BluetoothSession:
         self.emit = emit
         self.state = "not_paired"
         self.detail = ""
-        self.pair_fallback = False
         self.ready = False
         self._system: MessageBus | None = None
         self._session_bus: MessageBus | None = None
         self._agent: PairAgent | None = None
         self._agent_on = False
         self._advert_on = False
-        self._saved_class: tuple[int, int] | None = None
-        self._class_changed = False
+        self._advert_stop: asyncio.Task | None = None
         self._map_path = ""
         self._pbap_path = ""
         self._message_paths: dict[str, str] = {}
@@ -266,10 +234,14 @@ class BluetoothSession:
         self._announce_live = False
         self._listening = False
         self._contacts_watching = False
+        self._link_ticks = 0
+        self._last_link_try = 0.0
+        self._reconnecting = False
         # These must stay referenced. If Python collects them, new-text
         # alerts from the phone are silently dropped.
         self._obex_root = None
         self._obex_manager = None
+        self._bluez_manager = None
         self._tasks: set[asyncio.Task] = set()
         self.lock = asyncio.Lock()
 
@@ -292,6 +264,7 @@ class BluetoothSession:
         await self._adopt_paired_iphone()
         await self._refresh_presence()
         self.push_status()
+        self._track(self._watch_audio())
         if self.store.settings()["phoneAddress"]:
             self._track(self._safe_reconnect())
 
@@ -300,12 +273,18 @@ class BluetoothSession:
         await self._safe_reconnect()
 
     async def _safe_reconnect(self) -> None:
+        if self._reconnecting:
+            return
+        self._reconnecting = True
+        self._last_link_try = time.monotonic()
         try:
             async with self.lock:
                 await self._connect_saved()
         except Exception as exc:
             self.detail = public_error(exc)
             self.push_status()
+        finally:
+            self._reconnecting = False
 
     def push_status(self) -> None:
         settings = self.store.settings()
@@ -322,7 +301,6 @@ class BluetoothSession:
                     "unread": self.store.unread_count(),
                     "notifyBody": settings["notifyBody"],
                     "detail": self.detail,
-                    "pairFallback": self.pair_fallback,
                     "bluetoothReady": self.ready,
                 },
             }
@@ -342,21 +320,17 @@ class BluetoothSession:
         """Remember an iPhone that BlueZ already has paired, and tell the overlay."""
         devices = await self._phone_dicts()
         self.emit({"event": "devices", "devices": devices})
-        if not devices:
-            return
         saved = self.store.settings()["phoneAddress"].upper()
-        chosen = None
-        for device in devices:
-            if device["address"].upper() == saved:
-                chosen = device
-                break
-        if chosen is None:
-            for device in devices:
-                if device.get("connected"):
-                    chosen = device
-                    break
-            chosen = chosen or devices[0]
-            self.store.set_phone(chosen["address"], chosen["name"] or "iPhone")
+        if saved:
+            visible = any(device["address"].upper() == saved for device in devices)
+            self.state = "phone_nearby"
+            self.detail = "iPhone is paired." if visible else "The paired phone is not visible right now."
+            return
+        paired = [device for device in devices if device.get("paired")]
+        if len(paired) != 1:
+            return
+        chosen = paired[0]
+        self.store.set_phone(chosen["address"], chosen["name"] or "iPhone")
         # "connected" is reserved for a live message session. A Bluetooth
         # link alone means the phone is nearby and can be opened.
         self.state = "phone_nearby"
@@ -399,40 +373,35 @@ class BluetoothSession:
             self.push_status()
 
     async def pair(self, address: str, explicit: bool) -> None:
+        """Bond the phone, then open texts and contacts.
+
+        Enter connects first, which is what makes iOS finish pairing.
+        p calls Pair() when that connect stops. Audio profiles are
+        rejected and dropped either way.
+        """
         async with self.lock:
-            self.pair_fallback = False
-            previous = _read_adapter_class()
-            self._saved_class = previous
-            # Hands-free class (major 4, minor 8) is what makes iOS offer
-            # message and contact switches. Restored after this attempt.
-            self._class_changed = _set_adapter_class(4, 8)
+            self._cancel_advert_stop()
             try:
                 await self._register_agent()
                 device = await self._device(address)
                 name = await self._device_name(device)
                 try:
+                    bonded = await device.get_paired()
+                except Exception:
+                    bonded = False
+                if not bonded:
                     if explicit:
                         await device.call_pair()
                     else:
                         await device.call_connect()
-                except Exception as exc:
-                    if explicit:
-                        raise
-                    self.pair_fallback = True
-                    self.state = "not_paired"
-                    self.detail = "Connect-first pairing stopped. Press p for explicit pairing. That fallback can bond Classic Bluetooth only."
-                    self.emit({"event": "error", "message": public_error(exc)})
-                    self.push_status()
-                    return
-                try:
-                    await device.set_trusted(True)
-                except Exception:
-                    pass
+                        await self._drop_audio(address)
+                await self._untrust(address)
                 self.store.set_phone(address, name)
                 self.detail = "Paired. Waiting for the iPhone switches."
                 self.state = "waiting_for_switches"
                 self.push_status()
                 await self._start_advert()
+                self._schedule_advert_stop()
                 await self._open_profiles(address, announce=False)
             except Exception as exc:
                 self.detail = public_error(exc)
@@ -441,22 +410,27 @@ class BluetoothSession:
                 self.push_status()
             finally:
                 await self._unregister_agent()
-                self._restore_class_later()
 
-    def _restore_class_later(self) -> None:
-        """Put the adapter class back once iOS has had a moment to show the switches."""
+    def _cancel_advert_stop(self) -> None:
+        task = self._advert_stop
+        self._advert_stop = None
+        if task and not task.done():
+            task.cancel()
 
-        async def _restore():
-            await asyncio.sleep(120)
+    def _schedule_advert_stop(self) -> None:
+        """Drop the announcement if the message link is still down after a while."""
+        self._cancel_advert_stop()
+
+        async def _stop() -> None:
+            try:
+                await asyncio.sleep(120)
+            except asyncio.CancelledError:
+                return
             await self._stop_advert()
-            if self._class_changed and self._saved_class:
-                major, minor = self._saved_class
-                _set_adapter_class(major, minor)
-                self._class_changed = False
 
-        self._track(_restore())
+        self._advert_stop = self._track(_stop())
 
-    async def send(self, address: str, body: str) -> None:
+    async def send(self, address: str, body: str) -> str:
         async with self.lock:
             if not self._map_path:
                 raise RuntimeError("The phone is not connected for messages yet.")
@@ -483,7 +457,7 @@ class BluetoothSession:
                 except OSError:
                     pass
             label = self.store.label_for(value)
-            self.store.upsert_message(
+            row, _created = self.store.upsert_message(
                 external_id=f"local-{time.time_ns()}",
                 address=value,
                 body=body,
@@ -495,6 +469,7 @@ class BluetoothSession:
                 peer_label=label,
             )
             self._emit_threads()
+            return str(row["thread"]) if row else ""
 
     async def mark_read(self, thread: str) -> None:
         handles = self.store.mark_thread_read(thread)
@@ -529,48 +504,109 @@ class BluetoothSession:
         self.state = "phone_nearby"
         self.detail = "Reconnecting to the paired iPhone."
         self.push_status()
-        device = await self._device(address)
-        try:
-            connected = await device.get_connected()
-        except Exception:
-            connected = False
-        if not connected:
-            await device.call_connect()
+        await self._untrust(address)
+        await self._drop_audio(address)
         await self._open_profiles(address, announce=False)
 
-    async def _reset_phone_link(self, address: str) -> None:
-        """Drop the Bluetooth link and bring it back.
-
-        After the iPhone switch is turned on, the old link can still be
-        missing the message service. A fresh connection makes the phone
-        advertise it again.
-        """
-        device = await self._device(address)
+    async def _link_up(self, address: str) -> bool:
         try:
-            await device.call_disconnect()
+            device = await self._device(address)
+            return bool(await device.get_connected())
         except Exception:
-            pass
-        await asyncio.sleep(1.2)
-        await device.call_connect()
-        for _ in range(8):
+            return False
+
+    async def _bring_up_link(self, address: str) -> None:
+        """Connect the phone so it will offer the message service.
+
+        iOS does not publish MAP until the radio link is up. Device.Connect
+        is what completes that discovery. The agent rejects audio, and any
+        audio profile that still attaches is dropped before we return.
+        """
+        if await self._link_up(address):
+            await self._drop_audio(address)
+            return
+        started_agent = not self._agent_on
+        try:
+            await self._register_agent()
+            device = await self._device(address)
             try:
-                if await device.get_connected():
-                    return
+                await device.call_connect()
             except Exception:
                 pass
-            await asyncio.sleep(0.4)
+        finally:
+            await self._drop_audio(address)
+            if started_agent:
+                await self._unregister_agent()
+
+    async def _untrust(self, address: str) -> None:
+        """Stop BlueZ from attaching every profile with no question."""
+        try:
+            device = await self._device(address)
+            await device.set_trusted(False)
+        except Exception:
+            return
+
+    async def _drop_audio(self, address: str) -> None:
+        """Disconnect headset and media profiles if the phone opened them."""
+        try:
+            device = await self._device(address)
+        except Exception:
+            return
+        for uuid in audio_profile_uuids():
+            try:
+                await device.call_disconnect_profile(uuid)
+            except Exception:
+                continue
+
+    def _on_audio_added(self, path, interfaces) -> None:
+        address = self.store.settings()["phoneAddress"]
+        if not address:
+            return
+        needle = address.upper().replace(":", "_")
+        if needle not in str(path).upper():
+            return
+        names = set(interfaces.keys()) if isinstance(interfaces, dict) else set()
+        watched = {"org.bluez.MediaTransport1", "org.bluez.MediaControl1", "org.bluez.Headset1"}
+        if names.isdisjoint(watched):
+            return
+        self._track(self._drop_audio(address))
+
+    async def _watch_audio(self) -> None:
+        """Disconnect audio if the phone starts it after the message link is up."""
+        if not self._system:
+            return
+        try:
+            intro = await self._system.introspect("org.bluez", "/")
+            root = self._system.get_proxy_object("org.bluez", "/", intro)
+            manager = root.get_interface("org.freedesktop.DBus.ObjectManager")
+            self._bluez_manager = manager
+            manager.on_interfaces_added(self._on_audio_added)
+        except Exception:
+            return
 
     async def _open_profiles(self, address: str, announce: bool, recover: bool = True) -> None:
         await self._ensure_obexd()
+        await self._bring_up_link(address)
         await self._close_profiles()
         client = await self._iface("org.bluez.obex", "/org/bluez/obex", "org.bluez.obex.Client1", self._session_bus)
         try:
             self._map_path = await client.call_create_session(address, {"Target": Variant("s", "map")})
         except Exception as exc:
             text = str(exc).lower()
-            # One retry after a link reset. A second failure is shown as-is.
-            if recover and ("service record" in text or "0x43" in text or "busy" in text or "forbidden" in text):
-                await self._reset_phone_link(address)
+            # One retry after the radio link is up. iOS hides MAP until then.
+            retry = (
+                "service record" in text
+                or "0x43" in text
+                or "busy" in text
+                or "forbidden" in text
+                or "connection refused" in text
+                or "errno 111" in text
+                or "host is down" in text
+            )
+            if recover and retry:
+                await self._close_profiles()
+                await asyncio.sleep(1.2)
+                await self._bring_up_link(address)
                 await self._open_profiles(address, announce, recover=False)
                 return
             message = public_error(exc)
@@ -596,6 +632,7 @@ class BluetoothSession:
             self.detail = "Connected. New texts show up here. Older ones stay on the iPhone."
         self._announce_live = True
         await self._stop_advert()
+        await self._drop_audio(address)
         self._emit_threads()
         # People you have already texted are listed even when the phone
         # book download is still empty.
@@ -666,6 +703,10 @@ class BluetoothSession:
         # step fills that in. Skipping here would drop the text.
         if not sender:
             return None
+        # A display name is not a sendable address. The download inserts the
+        # row once the bMessage has a phone number or an email.
+        if not thread_key(sender, self.store.settings()["ownNumber"]).startswith(("tel:", "email:")):
+            return None
         sender_name = str(fields.get("Sender") or "")
         # A phone number is not a display name. Leave the label empty so the
         # contact cache can fill it in, and so a notification is not forced
@@ -688,6 +729,8 @@ class BluetoothSession:
             body_complete=False,
             peer_label=label,
         )
+        if row is None:
+            return None
         if announce and created and row["direction"] == "in" and not row["read"]:
             self.emit({"event": "message", "message": row, "notify": True})
         return row, created
@@ -698,7 +741,11 @@ class BluetoothSession:
         The returned object is a transfer. It stays "queued" until the
         phone finishes sending. When the object disappears, the file is ready.
         """
-        for _ in range(50):
+        return await self._wait_transfer_rounds(transfer_path, 50)
+
+    async def _wait_transfer_rounds(self, transfer_path: str, rounds: int) -> str:
+        """Wait until a transfer finishes. A vanished object means the file is ready."""
+        for _ in range(rounds):
             try:
                 intro = await self._session_bus.introspect("org.bluez.obex", transfer_path)
                 obj = self._session_bus.get_proxy_object("org.bluez.obex", transfer_path, intro)
@@ -708,10 +755,11 @@ class BluetoothSession:
                     )
                 )
             except Exception:
-                return
+                return "complete"
             if str(status) in ("complete", "error"):
-                return
+                return str(status)
             await asyncio.sleep(0.1)
+        return "timeout"
 
     async def _read_bmessage(self, target: Path) -> str:
         """Read a downloaded text, retrying while the file is still empty."""
@@ -771,7 +819,7 @@ class BluetoothSession:
             body_complete=True,
             peer_label=label,
         )
-        if announce and created and not sent:
+        if _row and announce and created and not sent:
             self.emit({"event": "message", "message": _row, "notify": True})
 
     async def _watch_contacts(self) -> None:
@@ -812,17 +860,34 @@ class BluetoothSession:
             "org.bluez.obex", self._pbap_path, "org.bluez.obex.PhonebookAccess1", self._session_bus
         )
         target = runtime_dir() / "contacts.vcf"
+        # Photos make the book huge, and a short wait then saves only the
+        # first cards. Names and numbers are enough to pick a person.
+        filters = {
+            "Format": Variant("s", "vcard30"),
+            "MaxCount": Variant("q", 65535),
+            "Fields": Variant("as", ["FN", "N", "TEL", "EMAIL", "NICKNAME"]),
+        }
         try:
             await phonebook.call_select("int", "pb")
-            # PullAll returns a transfer, same as a message download. The file
-            # is empty until that transfer finishes.
-            result = await phonebook.call_pull_all(str(target), {"Format": Variant("s", "vcard30")})
+            try:
+                result = await phonebook.call_pull_all(str(target), filters)
+            except Exception:
+                result = await phonebook.call_pull_all(
+                    str(target),
+                    {"Format": Variant("s", "vcard30"), "MaxCount": Variant("q", 65535)},
+                )
         except Exception:
             await self._drop_pbap()
             return
         transfer = str(result[0]) if isinstance(result, (list, tuple)) and result else ""
-        if transfer:
-            await self._wait_transfer(transfer)
+        # A full book can take longer than one text. A timed-out file is
+        # only the first slice, so it must not replace the saved list.
+        if transfer and await self._wait_transfer_rounds(transfer, 600) == "timeout":
+            try:
+                target.unlink()
+            except OSError:
+                pass
+            return
         try:
             raw = target.read_text(encoding="utf-8", errors="replace") if target.exists() else ""
         except OSError:
@@ -837,9 +902,14 @@ class BluetoothSession:
             # before Sync Contacts was turned on. Drop it and open a new one.
             await self._drop_pbap()
             return
+        cards = parse_vcards(raw)
         own = self.store.settings()["ownNumber"]
+        if not own:
+            code = dominant_calling_code([phone for card in cards for phone in card["phones"]])
+            if code:
+                own = "+" + code + "5555555555"
         rows = []
-        for card in parse_vcards(raw):
+        for card in cards:
             name = card["name"] or "Unknown"
             for phone in card["phones"]:
                 number = coerce_phone(phone, own) or ""
@@ -898,6 +968,13 @@ class BluetoothSession:
         """
         while self._session_bus:
             await asyncio.sleep(2)
+            self._link_ticks += 1
+            if self._link_ticks >= 8:
+                self._link_ticks = 0
+                try:
+                    await self._check_link()
+                except Exception:
+                    pass
             if not self._map_path:
                 continue
             try:
@@ -1019,6 +1096,40 @@ class BluetoothSession:
                 }
             )
         return found
+
+    async def _map_alive(self) -> bool:
+        """True when the message session is still on the bus."""
+        if not self._map_path or not self._session_bus:
+            return False
+        try:
+            await self._session_bus.introspect("org.bluez.obex", self._map_path)
+            return True
+        except Exception:
+            return False
+
+    async def _check_link(self) -> None:
+        """Drop a stale "connected" state and try the phone again.
+
+        The message session can die overnight while the card still says
+        connected. A dead session is cleared at once. A new attempt waits
+        half a minute so an absent phone is not dialed continuously.
+        """
+        if self._reconnecting or self.state in ("pairing", "scanning"):
+            return
+        if not self.store.settings()["phoneAddress"]:
+            return
+        radio = await self._link_up(self.store.settings()["phoneAddress"])
+        if radio and await self._map_alive():
+            return
+        if self.state == "connected" or self._map_path or self._pbap_path:
+            async with self.lock:
+                await self._close_profiles()
+                self.state = "phone_nearby"
+                self.detail = "The paired phone is not connected."
+                self.push_status()
+        if time.monotonic() - self._last_link_try < 30:
+            return
+        self._track(self._safe_reconnect())
 
     async def _refresh_presence(self) -> None:
         settings = self.store.settings()

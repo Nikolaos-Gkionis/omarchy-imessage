@@ -105,7 +105,25 @@ class AttachmentTests(unittest.TestCase):
         self.assertEqual(protocol.present_message("", True), "attachment omitted")
 
 
-class VCardTests(unittest.TestCase):
+class NameOnlyVCardTests(unittest.TestCase):
+    def test_family_and_given_name_are_shown(self):
+        raw = "BEGIN:VCARD\r\nN:Rivera;Sam;;;\r\nTEL;TYPE=CELL:+15557654321\r\nEND:VCARD\r\n"
+        people = protocol.parse_vcards(raw)
+        self.assertEqual(people[0]["name"], "Sam Rivera")
+
+    def test_a_folded_name_stays_whole(self):
+        raw = "BEGIN:VCARD\r\nFN:Sam \r\n Rivera\r\nTEL:+15557654321\r\nEND:VCARD\r\n"
+        people = protocol.parse_vcards(raw)
+        self.assertEqual(people[0]["name"], "Sam Rivera")
+        self.assertEqual(people[0]["phones"], ["+15557654321"])
+
+    def test_a_quoted_name_is_decoded(self):
+        raw = "BEGIN:VCARD\r\nFN;ENCODING=QUOTED-PRINTABLE:Sam=20Rivera\r\nTEL:+15557654321\r\nEND:VCARD\r\n"
+        people = protocol.parse_vcards(raw)
+        self.assertEqual(people[0]["name"], "Sam Rivera")
+
+
+class PlainVCardTests(unittest.TestCase):
     def test_reads_name_phone_and_email(self):
         raw = (
             "BEGIN:VCARD\n"
@@ -122,12 +140,75 @@ class VCardTests(unittest.TestCase):
         self.assertEqual(people[0]["emails"], ["ada@example.com"])
 
 
+class AudioProfileTests(unittest.TestCase):
+    def test_headset_and_media_profiles_are_audio(self):
+        for short in ("1108", "1112", "111e", "111f", "110a", "110b", "110c", "110e", "110f"):
+            self.assertTrue(protocol.is_audio_profile(short))
+            self.assertTrue(protocol.is_audio_profile(f"0000{short}-0000-1000-8000-00805f9b34fb"))
+
+    def test_message_and_phone_book_profiles_are_not_audio(self):
+        self.assertFalse(protocol.is_audio_profile("00001132-0000-1000-8000-00805f9b34fb"))
+        self.assertFalse(protocol.is_audio_profile("0000112f-0000-1000-8000-00805f9b34fb"))
+        self.assertEqual(len(protocol.audio_profile_uuids()), 9)
+
+
+class CallingCodeTests(unittest.TestCase):
+    def test_a_bare_ten_digit_number_uses_the_books_country(self):
+        code = protocol.dominant_calling_code(["+15551110000", "+15552220000", "+447911000000"])
+        self.assertEqual(code, "1")
+        self.assertEqual(protocol.coerce_phone("5551234567", "+1" + "5555555555"), "+15551234567")
+
+    def test_a_tie_does_not_guess_a_country(self):
+        self.assertEqual(protocol.dominant_calling_code(["+15551110000", "+447911000000"]), "")
+
+
+class PublicErrorTests(unittest.TestCase):
+    def test_a_missing_message_service_asks_for_the_iphone_switch(self):
+        text = protocol.public_error(RuntimeError("Unable to find service record"))
+        self.assertIn("Show Message Notifications", text)
+
+    def test_a_missing_file_is_not_a_missing_bluetooth_service(self):
+        text = protocol.public_error(FileNotFoundError("No such file or directory: '/tmp/incoming.bmsg'"))
+        self.assertNotIn("bluez-obex", text)
+
+    def test_a_missing_dbus_service_asks_for_obex(self):
+        exc = RuntimeError("org.freedesktop.DBus.Error.ServiceUnknown: The name org.bluez.obex was not provided")
+        text = protocol.public_error(exc)
+        self.assertIn("bluez-obex", text)
+
+    def test_authentication_failure_is_not_a_cancel(self):
+        text = protocol.public_error(RuntimeError("org.bluez.Error.AuthenticationFailed"))
+        self.assertEqual(text, "Pairing failed.")
+
+    def test_authentication_cancel_says_cancelled(self):
+        text = protocol.public_error(RuntimeError("org.bluez.Error.AuthenticationCanceled"))
+        self.assertEqual(text, "Pairing was cancelled.")
+
+
 class NotificationTests(unittest.TestCase):
     def test_number_is_not_used_as_a_title(self):
         self.assertEqual(protocol.notification_title("+15551234567"), "New message")
 
     def test_name_is_kept(self):
         self.assertEqual(protocol.notification_title("Ada Lovelace"), "Ada Lovelace")
+
+    def test_left_click_opens_that_conversation(self):
+        args = protocol.notification_command("Ada Lovelace", "hello", "tel:+15550001111")
+        self.assertEqual(args[:5], ["omarchy-notification-send", "--app-name=iMsg", "-u", "normal", "Ada Lovelace"])
+        self.assertEqual(args[5], "hello")
+        self.assertEqual(args[6:], [
+            "--exec",
+            "omarchy-shell",
+            "shell",
+            "summon",
+            "io.github.nikolaos-gkionis.messages",
+            '{"thread": "tel:+15550001111"}',
+        ])
+
+    def test_left_click_opens_the_panel_without_a_thread(self):
+        args = protocol.notification_command("New message", "", "")
+        self.assertNotIn("", args)
+        self.assertEqual(args[-1], "{}")
 
 
 if __name__ == "__main__":

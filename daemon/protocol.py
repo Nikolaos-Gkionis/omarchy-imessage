@@ -7,6 +7,8 @@ Bluetooth Message Access Profile uses to hand one text to a phone.
 
 from __future__ import annotations
 
+import json
+import quopri
 import re
 
 # One thousand characters is long enough for a real text and far below
@@ -20,6 +22,38 @@ _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 # Lines that would close the bMessage envelope early if a text contained them.
 _FENCE = re.compile(r"(?i)^(begin|end):(bmsg|bbody|benv|msg|vcard)\s*$")
 _BASE64_ALPHABET = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=")
+
+# Headset, hands-free, and media profiles. MAP and PBAP are not in this set.
+_AUDIO_PROFILE_IDS = (
+    "1108",  # HSP
+    "1112",  # HSP audio gateway
+    "111e",  # HFP
+    "111f",  # HFP audio gateway
+    "110a",  # A2DP source
+    "110b",  # A2DP sink
+    "110c",  # AVRCP target
+    "110e",  # AVRCP
+    "110f",  # AVRCP controller
+)
+
+def _profile_id(uuid: str) -> str:
+    """16-bit Bluetooth profile id from a short or 128-bit UUID."""
+    hexes = re.sub(r"[^0-9a-f]", "", (uuid or "").lower())
+    if len(hexes) >= 8 and hexes.startswith("0000"):
+        return hexes[4:8]
+    if len(hexes) == 4:
+        return hexes
+    return ""
+
+
+def is_audio_profile(uuid: str) -> bool:
+    """True when the UUID is a headset, hands-free, or media profile."""
+    return _profile_id(uuid) in _AUDIO_PROFILE_IDS
+
+
+def audio_profile_uuids() -> tuple[str, ...]:
+    """128-bit form of the profiles this program refuses."""
+    return tuple(f"0000{short}-0000-1000-8000-00805f9b34fb" for short in _AUDIO_PROFILE_IDS)
 
 
 def normalize_phone(value: str) -> str:
@@ -75,6 +109,26 @@ def calling_code(own_number: str) -> str:
     if digits[:2] in _CALLING_CODES_2:
         return digits[:2]
     return digits[:3] if len(digits) >= 3 else ""
+
+
+def dominant_calling_code(numbers: list[str]) -> str:
+    """Country code shared by most numbers that already include one.
+
+    A 10-digit number has no country of its own. The rest of the phone
+    book is the evidence for which country those numbers belong to.
+    """
+    counts: dict[str, int] = {}
+    for number in numbers:
+        code = calling_code(number)
+        if not code:
+            continue
+        counts[code] = counts.get(code, 0) + 1
+    if not counts:
+        return ""
+    code, count = max(counts.items(), key=lambda item: item[1])
+    if count * 2 <= sum(counts.values()):
+        return ""
+    return code
 
 
 def coerce_phone(value: str, own_number: str) -> str:
@@ -277,19 +331,59 @@ def present_message(body: str, has_attachment: bool) -> str:
     return text
 
 
+def _vcard_field(key: str) -> str:
+    """Field name from `item1.TEL;TYPE=CELL` or `FN;CHARSET=UTF-8`."""
+    field = key.split(";")[0].upper()
+    if "." in field:
+        field = field.rsplit(".", 1)[-1]
+    return field
+
+
+def _vcard_text(key: str, value: str) -> str:
+    """Plain text from a vCard value. iOS still quotes some names."""
+    text = value.strip()
+    if "QUOTED-PRINTABLE" not in key.upper():
+        return text
+    try:
+        return quopri.decodestring(text.encode("utf-8")).decode("utf-8", "replace").strip()
+    except Exception:
+        return text
+
+
+def _name_from_n(value: str) -> str:
+    """Display name from `Family;Given;Additional;Prefix;Suffix`."""
+    parts = [part.strip() for part in value.split(";")]
+    while len(parts) < 5:
+        parts.append("")
+    family, given, additional, prefix, suffix = parts[:5]
+    return " ".join(piece for piece in (prefix, given, additional, family, suffix) if piece)
+
+
 def parse_vcards(raw: str) -> list[dict]:
     """Read names, phones, and emails out of a PBAP vCard file.
 
     PBAP is the Bluetooth phone book. Each card can carry several numbers.
     Callers still run those numbers through the E.164 helpers before sending.
+    A card with only an N field still gets a name. Photo bytes are skipped.
     """
     people = []
     current = None
+    buf = ""
+    skip_fold = False
     for raw_line in raw.splitlines():
-        # A line that starts with a space continues the line above.
-        # Contact photos use that form and are not names or numbers.
         if raw_line.startswith((" ", "\t")):
+            folded = raw_line[1:]
+            # A photo is folded onto the next lines. It is not part of the
+            # phone number above it.
+            if folded.upper().startswith("PHOTO") or skip_fold:
+                skip_fold = True
+                continue
+            buf += folded
             continue
+        if buf:
+            _apply_vcard_line(current, buf)
+        buf = ""
+        skip_fold = False
         line = raw_line.strip()
         upper = line.upper()
         if upper.startswith("BEGIN:VCARD"):
@@ -300,22 +394,54 @@ def parse_vcards(raw: str) -> list[dict]:
                 people.append(current)
             current = None
             continue
-        if current is None or ":" not in line:
+        if ":" in line and _vcard_field(line.split(":", 1)[0]) == "PHOTO":
+            skip_fold = True
             continue
-        key, value = line.split(":", 1)
-        # iOS writes item1.TEL and item2.EMAIL. The part after the dot
-        # is the real field name.
-        field = key.split(";")[0].upper()
-        if "." in field:
-            field = field.rsplit(".", 1)[-1]
-        value = value.strip()
-        if field == "FN" and value:
-            current["name"] = value
-        elif field == "TEL" and value:
-            current["phones"].append(value)
-        elif field == "EMAIL" and value:
-            current["emails"].append(value)
+        buf = raw_line
+    if buf:
+        _apply_vcard_line(current, buf)
     return people
+
+
+def _apply_vcard_line(current: dict | None, raw_line: str) -> None:
+    if current is None:
+        return
+    line = raw_line.strip()
+    if ":" not in line:
+        return
+    key, value = line.split(":", 1)
+    field = _vcard_field(key)
+    value = _vcard_text(key, value)
+    if not value or field == "PHOTO":
+        return
+    if field == "FN":
+        current["name"] = value
+    elif field == "N" and not current["name"]:
+        current["name"] = _name_from_n(value)
+    elif field == "NICKNAME" and not current["name"]:
+        current["name"] = value.split(",")[0].strip()
+    elif field == "TEL":
+        current["phones"].append(value)
+    elif field == "EMAIL":
+        current["emails"].append(value)
+
+
+def notification_command(title: str, body: str, thread: str, program: str = "omarchy-notification-send") -> list[str]:
+    """Desktop notification whose left click opens this panel on that conversation."""
+    args = [program, "--app-name=iMsg", "-u", "normal", title]
+    text = (body or "").strip()
+    if text:
+        args.append(text[:120])
+    payload = json.dumps({"thread": thread}) if thread else "{}"
+    args.extend([
+        "--exec",
+        "omarchy-shell",
+        "shell",
+        "summon",
+        "io.github.nikolaos-gkionis.messages",
+        payload,
+    ])
+    return args
 
 
 def notification_title(sender: str) -> str:
@@ -342,14 +468,21 @@ def public_error(exc: BaseException) -> str:
     """
     text = str(exc)
     lowered = text.lower()
-    if "forbidden" in lowered or "0x43" in lowered or "not authorized" in lowered:
+    if (
+        "forbidden" in lowered
+        or "0x43" in lowered
+        or "not authorized" in lowered
+        or "service record" in lowered
+    ):
         return "The iPhone has not allowed message access yet. Turn on Show Message Notifications."
     if "connection refused" in lowered or "errno 111" in lowered or "host is down" in lowered:
         return "The phone is already in a message session with another computer, or it is out of range."
-    if "dbus" in lowered and "not found" in lowered or "no such file" in lowered or "serviceunknown" in lowered.replace(" ", ""):
+    if ("dbus" in lowered and "not found" in lowered) or "serviceunknown" in lowered.replace(" ", ""):
         return "Bluetooth messaging is not running. Install bluez-obex and make sure Bluetooth is on."
-    if "org.bluez.error.authentication" in lowered or "authentication" in lowered and "cancel" in lowered:
+    if "authentication" in lowered and "cancel" in lowered:
         return "Pairing was cancelled."
+    if "authentication" in lowered:
+        return "Pairing failed."
     # Keep a short class name when the text might contain a device path.
     name = type(exc).__name__
     if len(text) > 160 or "BEGIN:MSG" in text or "BEGIN:VCARD" in text:

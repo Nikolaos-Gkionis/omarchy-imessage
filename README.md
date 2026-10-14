@@ -45,7 +45,7 @@ omarchy restart shell
 
 1. Open the card. It looks for phones that are already paired. Highlight your iPhone and press Enter.
 2. A code appears here and on the phone. Press `y` here and confirm the same code on the phone. Press `n` to reject it.
-3. If pairing stops on its own, press `p`. That is explicit pairing. On some adapters it only bonds Classic Bluetooth, which is still enough for texts.
+3. If pairing stops on its own, press `p`. Enter connects and pairs. `p` pairs without that connect. On some adapters `p` only bonds Classic Bluetooth, which is still enough for texts. Either way this computer does not stay connected as a headset or a speaker.
 4. On the iPhone open **Settings → Bluetooth**, tap the **i** next to this computer, and turn on both switches in the picture. The phone may label the first one **Show Notifications** or **Show Message Notifications**. The second is **Sync Contacts**. They can take a minute to appear. If you see two entries with the same computer name, check both, then use this one.
 
 ![iPhone Bluetooth page for a computer named omarchy, with Show Notifications and Sync Contacts switched on.](docs/iphone-bluetooth-settings.jpg)
@@ -64,10 +64,10 @@ If the status line says the phone is already in a message session, another compu
 | `r` | Reply in the open conversation |
 | `n` | New text. Type to filter names, Enter to choose |
 | Ctrl+E | Open the emoji list while writing. Type a word, `j` / `k`, Enter to insert |
-| `/` | Filter the list you are in |
+| `/` | Start filtering the list you are in. Escape clears it |
 | `y` / `n` | Accept or reject the pairing code |
 | `p` | Explicit pairing, only on the phone list |
-| `t` | On the permission screen, include the message text in desktop notifications. This stays off until you turn it on |
+| `t` | Include the message text in desktop notifications. Press again to turn it off. Not while writing a reply, filtering, or picking an emoji |
 | `?` | Show every hint |
 | Escape | Step back, then close the card |
 

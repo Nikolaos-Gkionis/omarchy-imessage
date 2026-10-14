@@ -7,8 +7,8 @@ import qs.Commons
 import qs.Ui
 
 // Centered terminal-style card. The dim layer behind it is the overlay;
-// the card itself stays in the middle of the screen. Every message is
-// plain text. Images are never drawn.
+// the card itself stays in the middle of the screen. Message text is
+// escaped. A web address is the only thing that becomes a link.
 Item {
   id: root
 
@@ -23,6 +23,8 @@ Item {
   property string screen: "setup"
   property int selected: 0
   property string filterText: ""
+  property bool filterOn: false
+  property string notice: ""
   property string draft: ""
   property bool composeFocus: false
 
@@ -35,7 +37,13 @@ Item {
   property bool helpOn: false
   property string toAddress: ""
   property string toLabel: ""
+  property bool sendPending: false
   property string lastOpened: ""
+  property string pendingThread: ""
+  property bool openAfterDelete: false
+  property bool snapToLatest: false
+  property int snapTries: 0
+  property real lastSnapHeight: -1
   property bool caretOn: true
 
   Timer {
@@ -67,8 +75,24 @@ Item {
   // A window in the middle, not a sheet that covers the desktop.
   property int cardWidth: Math.min(Style.space(760), Math.max(Style.space(520), panel.width * 0.52))
   property int cardHeight: Math.min(Style.space(480), Math.max(Style.space(340), panel.height * 0.52))
+  // Width only. The measured height must not depend on the card height,
+  // or the layout loop freezes the desktop.
+  readonly property int draftInnerWidth: Math.max(40, Math.min(cardWidth, panel.width - Style.gapsOut * 2) - card.contentLeftInset - card.contentRightInset)
+  readonly property int draftLimit: draftOneLine.implicitHeight * 5
+  readonly property int composeGrow: root.composeFocus
+    ? Math.max(0, Math.min(draftMeasure.implicitHeight, root.draftLimit) - draftOneLine.implicitHeight)
+    : 0
 
   function open(payloadJson) {
+    root.pendingThread = ""
+    if (payloadJson) {
+      try {
+        var payload = JSON.parse(payloadJson)
+        if (payload && payload.thread)
+          root.pendingThread = String(payload.thread)
+      } catch (ignore) {
+      }
+    }
     root.opened = true
     root.holdingKeys = true
     root.helpOn = false
@@ -76,6 +100,7 @@ Item {
     root.toAddress = ""
     root.toLabel = ""
     root.filterText = ""
+    root.filterOn = false
     root.selected = 0
     root.followState(true)
     // A saved phone retries the message link. A missing phone starts a scan.
@@ -127,7 +152,8 @@ Item {
       root.cancelCompose()
       return
     }
-    if (root.filterText) {
+    if (root.filterOn) {
+      root.filterOn = false
       root.filterText = ""
       return
     }
@@ -184,8 +210,9 @@ Item {
   function rebuildShown() {
     if (root.screen === "contacts" || root.screen === "emoji")
       return
-    var keep = ""
-    if (root.selected >= 0 && root.selected < shownModel.count) {
+    var keep = root.pendingThread
+    root.pendingThread = ""
+    if (!keep && root.selected >= 0 && root.selected < shownModel.count) {
       var current = shownModel.get(root.selected)
       keep = current ? (current.key || current.address || "") : ""
     }
@@ -311,11 +338,39 @@ Item {
     if (root.selected < 0 || root.selected >= shownModel.count)
       return
     var row = shownModel.get(root.selected)
-    if (!row || !row.key || row.key === root.lastOpened)
+    if (!row || !row.key)
       return
+    // The card can already be on this conversation when a new text arrives.
+    // Loading is skipped then, but the text still has to be marked read.
+    var same = row.key === root.lastOpened
     root.lastOpened = row.key
-    root.svc.loadMessages(row.key)
+    if (!same)
+      root.svc.loadMessages(row.key)
     root.svc.markRead(row.key)
+    root.armLatest()
+  }
+
+  function armLatest() {
+    root.snapToLatest = true
+    root.snapTries = 0
+    root.lastSnapHeight = -1
+    snapTimer.restart()
+  }
+
+  function deleteSelected() {
+    if (root.screen !== "inbox" || !root.svc)
+      return
+    if (root.selected < 0 || root.selected >= shownModel.count)
+      return
+    var row = shownModel.get(root.selected)
+    if (!row || !row.key)
+      return
+    var key = row.key
+    root.lastOpened = ""
+    root.svc.clearMessages()
+    root.openAfterDelete = true
+    root.svc.deleteThread(key)
+    root.notice = "deleted"
   }
 
   function move(delta) {
@@ -366,6 +421,7 @@ Item {
     root.toLabel = row.name || row.address || "Contact"
     root.screen = "inbox"
     root.filterText = ""
+    root.filterOn = false
     root.rebuildShown()
     var chosen = root.selected >= 0 && root.selected < shownModel.count ? shownModel.get(root.selected) : null
     if (chosen && chosen.key) {
@@ -380,8 +436,20 @@ Item {
     root.startReply()
   }
 
+  function revealCaret() {
+    if (!root.composeFocus)
+      return
+    var rect = composer.cursorRectangle
+    var top = rect.y
+    var bottom = rect.y + rect.height
+    if (top < draftBox.contentY)
+      draftBox.contentY = top
+    else if (bottom > draftBox.contentY + draftBox.height)
+      draftBox.contentY = bottom - draftBox.height
+  }
+
   function startReply() {
-    // The hidden text field is what actually receives letters and paste.
+    // The text field receives letters, paste, and the arrow keys.
     composer.clear()
     root.draft = ""
     root.caretOn = true
@@ -437,8 +505,44 @@ Item {
     root.composeFocus = true
   }
 
+  function selectThread(thread) {
+    if (!thread)
+      return
+    for (var i = 0; i < shownModel.count; i++) {
+      var row = shownModel.get(i)
+      if (row && row.key === thread) {
+        root.selected = i
+        if (leftList)
+          leftList.positionViewAtIndex(i, ListView.Contain)
+        return
+      }
+    }
+  }
+
+  function acceptSend() {
+    if (!root.sendPending || !root.svc)
+      return
+    var thread = root.svc.sentThread || ""
+    root.sendPending = false
+    composer.clear()
+    root.draft = ""
+    root.toAddress = ""
+    root.toLabel = ""
+    root.composeFocus = false
+    root.screen = "inbox"
+    root.rebuildShown()
+    root.selectThread(thread)
+  }
+
+  function failSend() {
+    if (!root.sendPending)
+      return
+    root.sendPending = false
+    root.composeFocus = true
+  }
+
   function sendDraft() {
-    if (!root.svc)
+    if (!root.svc || root.sendPending)
       return
     var body = root.draft
     if (!body.trim())
@@ -448,19 +552,101 @@ Item {
       var row = shownModel.get(root.selected)
       thread = row ? row.key : ""
     }
+    root.svc.lastError = ""
+    root.sendPending = true
+    root.composeFocus = true
     root.svc.sendText(thread, root.toAddress, body)
-    composer.clear()
-    root.draft = ""
-    root.toAddress = ""
-    root.toLabel = ""
-    root.composeFocus = false
+  }
+
+  function escapeHtml(value) {
+    return String(value || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;")
+  }
+
+  function trimUrl(url) {
+    var cut = String(url || "")
+    while (cut.length && /[.,;:!?)]$/.test(cut)) {
+      if (cut.charAt(cut.length - 1) === ")") {
+        var open = (cut.match(/\(/g) || []).length
+        var close = (cut.match(/\)/g) || []).length
+        if (close <= open)
+          break
+      }
+      cut = cut.slice(0, -1)
+    }
+    return cut
+  }
+
+  function linkRanges(value) {
+    // Linear scans. A bare host such as voterep.co/j237n is a link too.
+    var text = String(value || "")
+    var ranges = []
+    var pattern = /https?:\/\/[^\s<>"']+|www\.[^\s<>"']+/gi
+    var match
+    while ((match = pattern.exec(text)) !== null) {
+      if (!match[0].length) {
+        pattern.lastIndex += 1
+        continue
+      }
+      var shown = root.trimUrl(match[0])
+      if (!shown)
+        continue
+      var href = /^https?:\/\//i.test(shown) ? shown : "https://" + shown
+      ranges.push({ start: match.index, end: match.index + shown.length, href: href })
+    }
+    var bare = /(?:^|[^A-Za-z0-9@])([A-Za-z0-9][A-Za-z0-9-]*\.(?:com|org|net|edu|gov|io|co|app|dev|me|tv|ai|us|uk|ca|de|ly|gg)(?:\/[^\s<>"']*)?)/gi
+    while ((match = bare.exec(text)) !== null) {
+      var word = root.trimUrl(match[1] || "")
+      if (!word)
+        continue
+      var start = match.index + match[0].length - (match[1] || "").length
+      var end = start + word.length
+      var overlaps = false
+      for (var n = 0; n < ranges.length; n++) {
+        if (start < ranges[n].end && end > ranges[n].start)
+          overlaps = true
+      }
+      if (overlaps)
+        continue
+      ranges.push({ start: start, end: end, href: "https://" + word })
+    }
+    ranges.sort(function(a, b) { return a.start - b.start })
+    return ranges
+  }
+
+  function styledMessage(value) {
+    // Text.StyledText draws the underline and the click target.
+    // Keep this off QTextDocument. A RichText anchor does not finish
+    // layout when the whole message is one long address.
+    var text = String(value || "")
+    var ranges = root.linkRanges(text)
+    var out = ""
+    var i = 0
+    for (var r = 0; r < ranges.length; r++) {
+      if (ranges[r].start < i)
+        continue
+      out += root.escapeHtml(text.slice(i, ranges[r].start)).replace(/\n/g, "<br/>")
+      out += "<a href=\"" + root.escapeHtml(ranges[r].href) + "\">"
+      out += root.escapeHtml(text.slice(ranges[r].start, ranges[r].end))
+      out += "</a>"
+      i = ranges[r].end
+    }
+    out += root.escapeHtml(text.slice(i)).replace(/\n/g, "<br/>")
+    return out
+  }
+
+  function openLink(url) {
+    var target = String(url || "")
+    if (!/^https?:\/\//i.test(target))
+      return
+    Qt.openUrlExternally(target)
   }
 
   function withEmojiFont(value) {
     // The card font has no emoji pictures. Qt on this desktop has no
     // "families" fallback, so emoji are wrapped in the emoji font.
-    // The message is escaped first, so it cannot be read as markup.
-    var raw = String(value || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    // A message that contains a link uses styledMessage instead. This
+    // span is RichText, and RichText does not finish a long address.
+    var raw = root.escapeHtml(String(value || ""))
     var out = ""
     var run = ""
     for (var i = 0; i < raw.length; i++) {
@@ -528,6 +714,14 @@ Item {
     return parseInt(value.substring(8, 10), 10) + " " + monthName + "  " + hm
   }
 
+  function toggleNotify() {
+    if (!root.svc)
+      return
+    var next = !root.svc.notifyBody
+    root.svc.setNotifyBody(next)
+    root.notice = next ? "notification text on" : "notification text off"
+  }
+
   function stateLabel() {
     if (!root.svc)
       return "starting"
@@ -543,13 +737,13 @@ Item {
 
   function hintLine() {
     if (root.helpOn)
-      return "esc close help    j/k move    enter select    n new text    r reply    / filter    t notification text    y/n pairing    p explicit pair"
+      return "esc close help    j/k move    enter select    n new text    r reply    / filter    ctrl+d delete    t notification text    y/n pairing    p explicit pair"
     if (root.screen === "code")
       return "y accept on this computer    n reject    esc cancel"
     if (root.screen === "checklist")
       return "t include message text in notifications (" + ((root.svc && root.svc.notifyBody) ? "on" : "off") + ")    esc back    ? help"
     if (root.screen === "contacts")
-      return "type to filter    j/k move    enter choose    esc back    Sync Contacts on the iPhone fills this list    ? help"
+      return "/ filter    j/k move    enter choose    esc back    ? help"
     if (root.screen === "emoji")
       return "type to search    j/k move    enter insert    esc back    ? help"
     if (root.composeFocus) {
@@ -557,8 +751,8 @@ Item {
       return "enter send" + (who ? " to " + who : "") + "    ctrl+e emoji    esc back"
     }
     if (root.screen === "setup")
-      return "j/k move    enter pair    enter scans again    p other pairing    esc close"
-    return "j/k move    enter open    r reply    n new    / filter    esc close    ? help"
+      return "j/k move    / filter    enter pair    p other pairing    esc close"
+    return "j/k move    enter open    r reply    n new    / filter    ctrl+d delete    esc close    ? help"
   }
 
   ListModel { id: shownModel }
@@ -572,14 +766,36 @@ Item {
     onLoaded: root.loadEmojis(text())
   }
 
+  Timer {
+    id: snapTimer
+    interval: 30
+    onTriggered: transcript.revealLatest()
+  }
+
   Connections {
     target: root.svc
     ignoreUnknownSignals: true
     function onStateChanged() { if (root.opened) root.followState(false) }
     function onPairCodeChanged() { if (root.opened && root.svc && root.svc.pairCode) root.screen = "code" }
-    function onThreadRevisionChanged() { if (root.screen === "inbox") root.rebuildShown() }
+    function onMessageRevisionChanged() {
+      if (!(root.opened && root.screen === "inbox" && root.lastOpened && root.svc))
+        return
+      root.svc.markRead(root.lastOpened)
+      root.armLatest()
+    }
+    function onThreadRevisionChanged() {
+      if (root.screen !== "inbox")
+        return
+      root.rebuildShown()
+      if (root.openAfterDelete) {
+        root.openAfterDelete = false
+        root.openSelectedThread()
+      }
+    }
     function onDeviceRevisionChanged() { if (root.screen === "setup") root.rebuildShown() }
     function onContactRevisionChanged() { if (root.screen === "contacts") root.selected = 0 }
+    function onSentRevisionChanged() { if (root.opened) root.acceptSend() }
+    function onErrorRevisionChanged() { if (root.opened) root.failSend() }
   }
 
   onScreenChanged: root.rebuildShown()
@@ -588,6 +804,27 @@ Item {
       root.svc.searchContacts(root.filterText)
     else
       root.rebuildShown()
+  }
+
+  Text {
+    id: draftOneLine
+    visible: false
+    width: Math.max(40, root.draftInnerWidth - draftPrompt.implicitWidth)
+    textFormat: Text.PlainText
+    text: " "
+    font.family: root.fontFamily
+    font.pixelSize: Style.font.body
+  }
+
+  Text {
+    id: draftMeasure
+    visible: false
+    width: Math.max(40, root.draftInnerWidth - draftPrompt.implicitWidth)
+    wrapMode: Text.Wrap
+    textFormat: Text.PlainText
+    font.family: root.fontFamily
+    font.pixelSize: Style.font.body
+    text: root.draft.length ? root.draft : " "
   }
 
   PanelWindow {
@@ -629,7 +866,7 @@ Item {
     BorderSurface {
       id: card
       width: Math.min(root.cardWidth, panel.width - Style.gapsOut * 2)
-      height: Math.min(root.cardHeight, panel.height - Style.gapsOut * 2)
+      height: Math.min(root.cardHeight + root.composeGrow, panel.height - Style.gapsOut * 2)
       radius: root.cornerRadius > 0 ? root.cornerRadius : Style.cornerRadius
       anchors.centerIn: parent
       color: root.background
@@ -644,36 +881,6 @@ Item {
         focus: !root.composeFocus
 
         Keys.priority: Keys.BeforeItem
-        TextInput {
-          id: composer
-          // Invisible on purpose. Key presses land here so an emoji, a
-          // composed character, or a paste becomes part of the reply.
-          opacity: 0
-          width: 1
-          height: 1
-          focus: root.composeFocus
-          inputMethodHints: Qt.ImhNoAutoUppercase
-          onTextChanged: root.draft = text
-          // BeforeItem runs before the text field's own shortcuts. Ctrl+E
-          // would otherwise jump to the end of the line and never open emojis.
-          Keys.priority: Keys.BeforeItem
-          Keys.onPressed: function(event) {
-            var ctrl = (event.modifiers & Qt.ControlModifier) && !(event.modifiers & Qt.AltModifier)
-            if (ctrl && event.key === Qt.Key_E) {
-              root.openEmoji()
-              event.accepted = true
-              return
-            }
-            if ((event.key === Qt.Key_Return || event.key === Qt.Key_Enter) && !(event.modifiers & Qt.ControlModifier)) {
-              root.sendDraft()
-              event.accepted = true
-              return
-            }
-            // Escape is handled by the window shortcut above, so a
-            // reply in progress cannot swallow the key.
-          }
-        }
-
         Keys.onPressed: function(event) {
           var printable = root.typingText(event)
 
@@ -689,6 +896,15 @@ Item {
             return
           }
 
+          var allowNotifyToggle = event.key === Qt.Key_T && !root.composeFocus && !root.filterOn && root.screen !== "emoji" && root.svc
+          if (!allowNotifyToggle)
+            root.notice = ""
+          else {
+            root.toggleNotify()
+            event.accepted = true
+            return
+          }
+
           if (root.screen === "code") {
             if (event.key === Qt.Key_Y && root.svc) root.svc.confirm(true)
             else if (event.key === Qt.Key_N && root.svc) root.svc.confirm(false)
@@ -697,7 +913,6 @@ Item {
           }
 
           if (root.screen === "checklist") {
-            if (event.key === Qt.Key_T && root.svc) root.svc.setNotifyBody(!root.svc.notifyBody)
             event.accepted = true
             return
           }
@@ -718,30 +933,38 @@ Item {
           }
 
           if (root.composeFocus) {
-            // Ctrl+E opens the emoji list. Enter sends. Other keys, including
-            // paste, stay with the hidden text field.
-            if ((event.modifiers & Qt.ControlModifier) && event.key === Qt.Key_E) root.openEmoji()
-            else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) root.sendDraft()
-            else {
-              return
+            // Ctrl+E opens the emoji list. Enter sends. Arrows and letters
+            // stay with the text field so the cursor can move.
+            if ((event.modifiers & Qt.ControlModifier) && event.key === Qt.Key_E) {
+              root.openEmoji()
+              event.accepted = true
+            } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+              root.sendDraft()
+              event.accepted = true
+            } else {
+              event.accepted = false
             }
-            event.accepted = true
             return
           }
 
           if (root.screen === "contacts") {
             if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) root.pickContact()
-            else if (event.key === Qt.Key_Backspace) root.backspace("filter")
-            else if (event.key === Qt.Key_Down || (event.key === Qt.Key_J && !root.filterText)) root.move(1)
-            else if (event.key === Qt.Key_Up || (event.key === Qt.Key_K && !root.filterText)) root.move(-1)
-            else if (printable && event.text !== "/") root.typeInto("filter", event.text)
+            else if (event.key === Qt.Key_Backspace) {
+              if (root.filterOn && root.filterText.length === 0) root.filterOn = false
+              else if (root.filterOn) root.backspace("filter")
+            } else if (!root.filterOn && (event.key === Qt.Key_Down || event.key === Qt.Key_J)) root.move(1)
+            else if (!root.filterOn && (event.key === Qt.Key_Up || event.key === Qt.Key_K)) root.move(-1)
+            else if (!root.filterOn && event.key === Qt.Key_Slash) {
+              root.filterOn = true
+              root.filterText = ""
+            } else if (root.filterOn && printable) root.typeInto("filter", event.text)
             event.accepted = true
             return
           }
 
-          // j and k move only when you are not in the middle of a filter.
-          // Otherwise the letters j and k could never appear in a search.
-          var filtering = root.filterText.length > 0
+          // A letter moves or runs a command until / starts a filter.
+          // Inside the filter, j and k are letters in the search.
+          var filtering = root.filterOn
           if (event.key === Qt.Key_Down || (event.key === Qt.Key_J && !filtering)) root.move(1)
           else if (event.key === Qt.Key_Up || (event.key === Qt.Key_K && !filtering)) root.move(-1)
           else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
@@ -756,16 +979,23 @@ Item {
           } else if (!filtering && (event.modifiers & Qt.ControlModifier) && event.key === Qt.Key_E && root.screen === "inbox") {
             root.startReply()
             root.openEmoji()
+          } else if (!filtering && (event.modifiers & Qt.ControlModifier) && event.key === Qt.Key_D && root.screen === "inbox") {
+            root.deleteSelected()
           } else if (!filtering && event.key === Qt.Key_N && root.screen === "inbox") {
             root.screen = "contacts"
+            root.filterOn = false
             root.filterText = ""
             root.selected = 0
             root.composeFocus = false
             if (root.svc) root.svc.searchContacts("")
           } else if (!filtering && event.key === Qt.Key_P && root.screen === "setup") root.pairSelected(true)
-          else if (event.key === Qt.Key_Slash) root.filterText = ""
-          else if (event.key === Qt.Key_Backspace) root.backspace("filter")
-          else if (printable) root.typeInto("filter", event.text)
+          else if (!filtering && event.key === Qt.Key_Slash) {
+            root.filterOn = true
+            root.filterText = ""
+          } else if (filtering && event.key === Qt.Key_Backspace) {
+            if (root.filterText.length === 0) root.filterOn = false
+            else root.backspace("filter")
+          } else if (filtering && printable) root.typeInto("filter", event.text)
           event.accepted = true
         }
 
@@ -798,14 +1028,20 @@ Item {
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
             text: {
+              if (root.filterOn && root.screen !== "code" && root.screen !== "emoji" && root.screen !== "checklist")
+                return "/" + root.filterText
               if (root.screen === "code")
                 return "Pairing code  " + (root.svc ? root.svc.pairCode : "")
+              if (root.notice)
+                return root.notice
               if (root.screen === "checklist")
                 return "On the iPhone open Bluetooth, tap this computer, then turn on Show Message Notifications and Sync Contacts."
               if (root.screen === "emoji")
                 return root.emojiFilter ? ("Emoji  " + root.emojiFilter) : "Pick an emoji"
               if (root.screen === "contacts")
                 return "Choose who to text"
+              if (root.svc && root.svc.lastError)
+                return root.svc.lastError
               if (root.screen === "setup")
                 return root.svc && root.svc.state === "scanning" ? "Looking for your iPhone" : "Select your iPhone"
               return root.stateLabel() + (root.svc && root.svc.phoneName ? "  " + root.svc.phoneName : "")
@@ -841,9 +1077,9 @@ Item {
                   anchors.leftMargin: Style.space(12)
                   anchors.rightMargin: Style.space(8)
                   verticalAlignment: Text.AlignVCenter
-                  textFormat: Text.RichText
+                  textFormat: root.linkRanges(root.rowText(index)).length ? Text.PlainText : Text.RichText
                   elide: Text.ElideRight
-                  text: root.withEmojiFont(root.rowText(index))
+                  text: root.linkRanges(root.rowText(index)).length ? root.rowText(index) : root.withEmojiFont(root.rowText(index))
                   color: index === root.selected ? root.selectedText : root.foreground
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.body
@@ -879,27 +1115,87 @@ Item {
               clip: true
               model: root.svc ? root.svc.messages : 0
               boundsBehavior: Flickable.StopAtBounds
-              onCountChanged: if (count > 0) positionViewAtEnd()
+              // The bubble height arrives after the row exists. Scrolling in
+              // this signal, before that height, was leaving the newest text
+              // below the fold and could re-enter layout.
+              onCountChanged: if (count > 0 && root.snapToLatest) snapTimer.restart()
+              onDraggingChanged: if (dragging) root.snapToLatest = false
+              // A link bubble grows after the first layout. Keep pulling to
+              // the newest text until the content height stays put.
+              function revealLatest() {
+                if (!root.snapToLatest || count < 1) {
+                  root.snapToLatest = false
+                  return
+                }
+                var bottom = Math.max(0, contentHeight - height)
+                if (Math.abs(contentY - bottom) > 1)
+                  contentY = bottom
+                root.snapTries += 1
+                var settled = contentHeight === root.lastSnapHeight && Math.abs(contentY - bottom) <= 1
+                root.lastSnapHeight = contentHeight
+                if (!settled && root.snapTries < 12) {
+                  snapTimer.restart()
+                  return
+                }
+                root.snapToLatest = false
+              }
 
               delegate: Item {
                 required property string body
                 required property string direction
                 required property string timestamp
+                // textFormat stays fixed on each Text. Flipping one item
+                // between RichText and StyledText spins the list on a
+                // conversation change.
+                readonly property bool linked: root.linkRanges(body).length > 0
+                // One extra pixel. The drawn text is slightly wider than a
+                // plain measurement, and "boo ho" was wrapping at the space.
+                readonly property int textCap: Math.max(1, transcript.width * 0.62)
+                readonly property int textWidth: {
+                  var natural = linked ? linkMeasure.implicitWidth : emojiMeasure.implicitWidth
+                  if (natural <= 0)
+                    return textCap
+                  if (natural > textCap)
+                    return Math.floor(textCap)
+                  return Math.ceil(natural) + 1
+                }
+                // Not a binding to the styled text. A live height binding
+                // spins the list when the conversation changes.
+                property int textHeight: 0
+                function syncTextHeight() {
+                  var next = Math.ceil(linked ? linkText.implicitHeight : emojiText.implicitHeight)
+                  if (next > 0 && next !== textHeight) {
+                    textHeight = next
+                    if (root.snapToLatest)
+                      snapTimer.restart()
+                  }
+                }
+                onTextWidthChanged: Qt.callLater(syncTextHeight)
+                onLinkedChanged: Qt.callLater(syncTextHeight)
+                onBodyChanged: Qt.callLater(syncTextHeight)
+                Component.onCompleted: syncTextHeight()
                 width: transcript.width
                 height: bubbleColumn.height + Style.space(10)
 
-                // A hidden line measures the words so the bubble can hug them
-                // instead of stretching across the whole conversation.
                 Text {
-                  id: measure
+                  id: emojiMeasure
                   visible: false
-                  // Plain text on purpose. Qt's default AutoText parser can
-                  // treat a message as HTML and start an image download while
-                  // it measures the width, even when this line is hidden.
-                  textFormat: Text.PlainText
-                  text: body
+                  wrapMode: Text.NoWrap
+                  textFormat: Text.RichText
+                  text: linked ? "" : root.withEmojiFont(body)
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.body
+                }
+
+                Text {
+                  id: linkMeasure
+                  visible: false
+                  wrapMode: Text.NoWrap
+                  textFormat: Text.StyledText
+                  text: linked ? root.styledMessage(body) : ""
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                  linkColor: direction === "out" ? root.selectedText : root.foreground
                 }
 
                 Column {
@@ -912,20 +1208,53 @@ Item {
                     id: bubble
                     radius: Style.space(8)
                     color: direction === "out" ? root.selectedBackground : root.incomingBubble
-                    width: bodyText.width + Style.space(20)
-                    height: bodyText.implicitHeight + Style.space(14)
+                    width: textWidth + Style.space(20)
+                    height: textHeight + Style.space(14)
 
                     Text {
-                      id: bodyText
+                      id: emojiText
                       x: Style.space(10)
                       y: Style.space(7)
-                      width: Math.min(measure.implicitWidth, transcript.width * 0.62)
-                      wrapMode: Text.Wrap
+                      width: textWidth
+                      visible: !linked
+                      wrapMode: Text.WrapAtWordBoundaryOrAnywhere
                       textFormat: Text.RichText
-                      text: root.withEmojiFont(body)
+                      text: linked ? "" : root.withEmojiFont(body)
                       color: direction === "out" ? root.selectedText : root.foreground
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.body
+                    }
+
+                    Text {
+                      id: linkText
+                      x: Style.space(10)
+                      y: Style.space(7)
+                      width: textWidth
+                      visible: linked
+                      wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+                      textFormat: Text.StyledText
+                      text: linked ? root.styledMessage(body) : ""
+                      color: direction === "out" ? root.selectedText : root.foreground
+                      linkColor: direction === "out" ? root.selectedText : root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.body
+                    }
+
+                    MouseArea {
+                      anchors.fill: parent
+                      hoverEnabled: true
+                      onPositionChanged: function(mouse) {
+                        var link = linkText.linkAt(mouse.x - linkText.x, mouse.y - linkText.y)
+                        cursorShape = link ? Qt.PointingHandCursor : Qt.ArrowCursor
+                      }
+                      onExited: cursorShape = Qt.ArrowCursor
+                      onClicked: function(mouse) {
+                        var link = linkText.linkAt(mouse.x - linkText.x, mouse.y - linkText.y)
+                        if (link)
+                          root.openLink(link)
+                        else
+                          mouse.accepted = false
+                      }
                     }
                   }
 
@@ -1021,15 +1350,65 @@ Item {
             }
           }
 
-          Text {
+          Flickable {
+            id: draftBox
             Layout.fillWidth: true
             visible: root.composeFocus
-            textFormat: Text.RichText
-            elide: Text.ElideRight
-            color: root.foreground
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.body
-            text: root.withEmojiFont("> " + root.draft + (root.caretOn ? "▌" : " "))
+            clip: true
+            boundsBehavior: Flickable.StopAtBounds
+            flickableDirection: Flickable.VerticalFlick
+            interactive: draftMeasure.implicitHeight > height
+            contentWidth: root.draftInnerWidth
+            contentHeight: draftMeasure.implicitHeight
+            Layout.preferredHeight: Math.min(draftMeasure.implicitHeight, root.draftLimit)
+
+            Row {
+              width: root.draftInnerWidth
+              height: Math.max(draftMeasure.implicitHeight, draftOneLine.implicitHeight)
+              spacing: 0
+
+              Text {
+                id: draftPrompt
+                text: "> "
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+              }
+
+              TextEdit {
+                id: composer
+                width: Math.max(40, root.draftInnerWidth - draftPrompt.implicitWidth)
+                height: Math.max(draftMeasure.implicitHeight, draftOneLine.implicitHeight)
+                focus: root.composeFocus
+                wrapMode: Text.Wrap
+                textFormat: Text.PlainText
+                selectByMouse: true
+                color: root.foreground
+                selectionColor: root.selectedBackground
+                selectedTextColor: root.selectedText
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                inputMethodHints: Qt.ImhNoAutoUppercase
+                onTextChanged: root.draft = text
+                onCursorPositionChanged: Qt.callLater(root.revealCaret)
+                // BeforeItem runs before the field's own shortcuts. Ctrl+E
+                // would otherwise jump to the end of the line.
+                Keys.priority: Keys.BeforeItem
+                Keys.onPressed: function(event) {
+                  event.accepted = false
+                  var ctrl = (event.modifiers & Qt.ControlModifier) && !(event.modifiers & Qt.AltModifier)
+                  if (ctrl && event.key === Qt.Key_E) {
+                    root.openEmoji()
+                    event.accepted = true
+                    return
+                  }
+                  if ((event.key === Qt.Key_Return || event.key === Qt.Key_Enter) && !(event.modifiers & Qt.ControlModifier)) {
+                    root.sendDraft()
+                    event.accepted = true
+                  }
+                }
+              }
+            }
           }
 
           Rectangle {
@@ -1063,6 +1442,22 @@ Item {
             }
             Text {
               text: "n new"
+              Layout.fillWidth: true
+              horizontalAlignment: Text.AlignHCenter
+              color: root.muted
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+            Text {
+              text: "/ filter"
+              Layout.fillWidth: true
+              horizontalAlignment: Text.AlignHCenter
+              color: root.muted
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+            Text {
+              text: "ctrl+d delete"
               Layout.fillWidth: true
               horizontalAlignment: Text.AlignHCenter
               color: root.muted

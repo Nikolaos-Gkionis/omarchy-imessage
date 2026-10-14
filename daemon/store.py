@@ -86,6 +86,10 @@ class Store:
               body_complete INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS messages_thread ON messages(thread_key, timestamp);
+
+            CREATE TABLE IF NOT EXISTS deleted_messages (
+              external_id TEXT PRIMARY KEY
+            );
             """
         )
         self._db.commit()
@@ -101,6 +105,20 @@ class Store:
 
     def set_own_number(self, number: str) -> None:
         self._db.execute("UPDATE settings SET own_number = ? WHERE id = 1", (number,))
+        self._db.commit()
+        self._rethread(number)
+
+    def _rethread(self, own: str) -> None:
+        """Move a raw key onto a phone or email key once the country code is known."""
+        rows = self._db.execute("SELECT id, thread_key FROM messages").fetchall()
+        for row in rows:
+            key = row["thread_key"]
+            if not key.startswith("raw:"):
+                continue
+            new_key = thread_key(key[4:], own)
+            if new_key == key or not (new_key.startswith("tel:") or new_key.startswith("email:")):
+                continue
+            self._db.execute("UPDATE messages SET thread_key = ? WHERE id = ?", (new_key, row["id"]))
         self._db.commit()
 
     def set_phone(self, address: str, name: str) -> None:
@@ -147,7 +165,9 @@ class Store:
 
         The phone book arrives only after Sync Contacts is on. Until then,
         the person who texted you can still be chosen for a reply.
+        An empty query is the whole book. A typed query stays short.
         """
+        cap = limit if query.strip() else max(limit, 10000)
         like = f"%{query.strip().lower()}%"
         rows = self._db.execute(
             """
@@ -156,7 +176,7 @@ class Store:
             ORDER BY name COLLATE NOCASE, address
             LIMIT ?
             """,
-            (like, like, limit),
+            (like, like, cap),
         ).fetchall()
         found = [{"name": row["name"], "address": row["address"], "kind": row["kind"]} for row in rows]
         seen = {row["address"] for row in found}
@@ -174,9 +194,9 @@ class Store:
             kind = "email" if "@" in address else "tel"
             found.append({"name": name, "address": address, "kind": kind})
             seen.add(address)
-            if len(found) >= limit:
+            if len(found) >= cap:
                 break
-        return found
+        return _one_row_per_person(found)
 
     def apply_contact_names(self) -> int:
         """Replace a bare phone number on a conversation with the contact's name."""
@@ -217,9 +237,18 @@ class Store:
         body_complete: bool,
         peer_label: str = "",
     ) -> tuple[dict, bool]:
-        """Insert or update one text. Returns the row and whether it was new."""
+        """Insert or update one text. Returns the row and whether it was new.
+
+        A text from a conversation you deleted stays deleted. A later new
+        text from that person still arrives.
+        """
+        if self._db.execute(
+            "SELECT 1 FROM deleted_messages WHERE external_id = ?",
+            (external_id,),
+        ).fetchone():
+            return None, False
         own = self.settings()["ownNumber"]
-        key = thread_key(address, own)
+        direct = thread_key(address, own)
         label = peer_label or self.label_for(address) or ""
         if not label or label == address:
             earlier = self._db.execute(
@@ -228,14 +257,16 @@ class Store:
                 WHERE thread_key = ? AND peer_label != '' AND peer_label != ?
                 ORDER BY id LIMIT 1
                 """,
-                (key, address),
+                (direct, address),
             ).fetchone()
             if earlier:
                 label = earlier["peer_label"]
         if not label:
             label = address
+        # A phone and an email on the same contact are one conversation.
+        key = self.conversation_key(address, label)
         existing = self._db.execute(
-            "SELECT id, read, body_complete FROM messages WHERE external_id = ?",
+            "SELECT id, read, body_complete, thread_key, direction FROM messages WHERE external_id = ?",
             (external_id,),
         ).fetchone()
         if existing:
@@ -243,23 +274,29 @@ class Store:
             next_read = 1 if existing["read"] or read else 0
             next_complete = 1 if existing["body_complete"] or body_complete else 0
             next_body = body if body_complete or not existing["body_complete"] else None
+            next_key = key if key.startswith("tel:") or key.startswith("email:") else existing["thread_key"]
+            # A preview can file the text under a name. The downloaded body
+            # carries the real address and the real direction.
+            next_direction = direction if body_complete and not existing["body_complete"] else existing["direction"]
             if next_body is None:
                 self._db.execute(
                     """
                     UPDATE messages
-                    SET read = ?, has_attachment = ?, body_complete = ?, peer_label = ?
+                    SET read = ?, has_attachment = ?, body_complete = ?, peer_label = ?,
+                        thread_key = ?, direction = ?
                     WHERE id = ?
                     """,
-                    (next_read, 1 if has_attachment else 0, next_complete, label, existing["id"]),
+                    (next_read, 1 if has_attachment else 0, next_complete, label, next_key, next_direction, existing["id"]),
                 )
             else:
                 self._db.execute(
                     """
                     UPDATE messages
-                    SET body = ?, read = ?, has_attachment = ?, body_complete = ?, peer_label = ?
+                    SET body = ?, read = ?, has_attachment = ?, body_complete = ?, peer_label = ?,
+                        thread_key = ?, direction = ?
                     WHERE id = ?
                     """,
-                    (body, next_read, 1 if has_attachment else 0, next_complete, label, existing["id"]),
+                    (body, next_read, 1 if has_attachment else 0, next_complete, label, next_key, next_direction, existing["id"]),
                 )
             self._db.commit()
             return self._message_by_id(existing["id"]), False
@@ -302,7 +339,84 @@ class Store:
             "bodyComplete": bool(row["body_complete"]),
         }
 
+    def conversation_key(self, address: str, label: str) -> str:
+        """Thread key for an address. An email joins that person's phone thread."""
+        own = self.settings()["ownNumber"]
+        direct = thread_key(address, own)
+        if direct.startswith("tel:"):
+            return direct
+        name = (label or "").strip()
+        if not name or name == address:
+            looked = self.label_for(address)
+            if looked and looked != address:
+                name = looked
+        if not name or name == address:
+            return direct
+        existing = self._db.execute(
+            """
+            SELECT thread_key FROM messages
+            WHERE lower(peer_label) = lower(?) AND thread_key LIKE 'tel:%'
+            GROUP BY thread_key
+            ORDER BY COUNT(*) DESC, MIN(id) ASC
+            LIMIT 1
+            """,
+            (name,),
+        ).fetchone()
+        if existing:
+            return str(existing["thread_key"])
+        phones = self._db.execute(
+            "SELECT address FROM contacts WHERE lower(name) = lower(?) AND kind = 'tel'",
+            (name,),
+        ).fetchall()
+        tels = []
+        for phone in phones:
+            key = thread_key(str(phone["address"]), own)
+            if key.startswith("tel:") and key not in tels:
+                tels.append(key)
+        if len(tels) == 1:
+            return tels[0]
+        return direct
+
+    def fold_same_person(self) -> int:
+        """Move an email conversation onto that person's phone conversation."""
+        changed = 0
+        rows = self._db.execute(
+            "SELECT id, thread_key, peer_label FROM messages WHERE thread_key LIKE 'email:%'"
+        ).fetchall()
+        for row in rows:
+            target = self.conversation_key(address_from_thread(row["thread_key"]), row["peer_label"])
+            if target.startswith("tel:") and target != row["thread_key"]:
+                self._db.execute(
+                    "UPDATE messages SET thread_key = ? WHERE id = ?",
+                    (target, row["id"]),
+                )
+                changed += 1
+        if changed:
+            self._db.commit()
+        return changed
+
+    def delete_thread(self, key: str) -> int:
+        """Remove one conversation. The same texts are not saved again."""
+        key = str(key or "")
+        if not key:
+            return 0
+        rows = self._db.execute(
+            "SELECT external_id FROM messages WHERE thread_key = ?",
+            (key,),
+        ).fetchall()
+        for row in rows:
+            external_id = row["external_id"]
+            if external_id:
+                self._db.execute(
+                    "INSERT OR IGNORE INTO deleted_messages (external_id) VALUES (?)",
+                    (external_id,),
+                )
+        deleted = self._db.execute("DELETE FROM messages WHERE thread_key = ?", (key,))
+        self._db.commit()
+        return int(deleted.rowcount)
+
     def threads(self) -> list[dict]:
+        self.fold_same_person()
         rows = self._db.execute(
             """
             SELECT m.thread_key, m.peer_label, m.body, m.has_attachment, m.timestamp,
@@ -312,10 +426,15 @@ class Store:
                    ) AS unread
             FROM messages m
             JOIN (
-              SELECT thread_key, MAX(timestamp) AS timestamp
-              FROM messages GROUP BY thread_key
-            ) latest ON latest.thread_key = m.thread_key AND latest.timestamp = m.timestamp
-            ORDER BY unread DESC, m.timestamp DESC
+              SELECT thread_key, MAX(id) AS id
+              FROM messages
+              WHERE (thread_key, timestamp) IN (
+                SELECT thread_key, MAX(timestamp) AS timestamp
+                FROM messages GROUP BY thread_key
+              )
+              GROUP BY thread_key
+            ) latest ON latest.id = m.id
+            ORDER BY unread DESC, m.timestamp DESC, m.id DESC
             """
         ).fetchall()
         seen = set()
@@ -376,3 +495,19 @@ class Store:
     @staticmethod
     def now_stamp() -> str:
         return time.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _one_row_per_person(rows: list[dict]) -> list[dict]:
+    """One list row per name. A phone number wins over an email."""
+    chosen: dict[str, dict] = {}
+    order: list[str] = []
+    for row in rows:
+        key = (row["name"] or row["address"]).strip().casefold()
+        current = chosen.get(key)
+        if current is None:
+            chosen[key] = row
+            order.append(key)
+            continue
+        if current["kind"] != "tel" and row["kind"] == "tel":
+            chosen[key] = row
+    return [chosen[key] for key in order]
